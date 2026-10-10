@@ -101,6 +101,14 @@ The remaining options are settable both ways, as a `langfuse.json` key or as the
 
 Everything the plugin traces is uploaded to Langfuse, including prompts and tool inputs and outputs, so do not enable it for sessions containing data you do not want stored there.
 
+## Build and review
+
+The Git marketplace ships `dist/index.mjs`. CI rebuilds it and requires byte
+identity with the committed artifact. CodeQL analyzes the TypeScript source
+and tests; the generated dependency bundle is excluded from duplicate source
+analysis. Dependency integrity remains pinned in `pnpm-lock.yaml` and checked
+by Socket.
+
 ## Contributing
 
 See the [contributing guide](./CONTRIBUTING.md).

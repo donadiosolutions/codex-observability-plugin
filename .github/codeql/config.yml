@@ -1,0 +1,5 @@
+name: Plugin source analysis
+# The standalone artifact embeds unchanged npm dependencies. CI rebuilds it
+# byte-for-byte from the scanned TypeScript and the integrity-pinned lockfile.
+paths-ignore:
+  - plugins/tracing/dist
