@@ -1,6 +1,8 @@
+import { createHash } from "node:crypto";
 import { createReadStream, type Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import * as os from "node:os";
 import { createInterface } from "node:readline";
 
 import {
@@ -14,12 +16,18 @@ import {
 import { TraceFlags, type SpanContext } from "@opentelemetry/api";
 
 import type { Config } from "./config.js";
-import { currentIdSeed, seedIds } from "./instrumentation.js";
+import {
+  currentIdSeed,
+  seedIds,
+  flushInstrumentation,
+  backpressureInstrumentation,
+} from "./instrumentation.js";
 import { parseArgs, parseSession } from "./parse.js";
-import { loadUploadedTurnIds } from "./sidecar.js";
+import { loadUploadedTurnIds, loadLegacyTurnIds } from "./sidecar.js";
 import { skillsForToolCall, traceTags } from "./skills.js";
 import type {
   EventMsgPayload,
+  HookEvent,
   ModelStep,
   RolloutLine,
   SessionMeta,
@@ -100,12 +108,14 @@ export async function buildSubagentIndex(
   rolloutFile: string,
   options: { includeEarlierDays?: boolean } = {},
 ): Promise<SubagentIndex> {
-  const root = path.resolve(path.dirname(rolloutFile), "../../..");
+  const rolloutDirectory = path.dirname(rolloutFile);
+  const dated = /[\/]\d{4}[\/]\d{2}[\/]\d{2}$/.test(rolloutDirectory);
+  const root = dated ? path.resolve(rolloutDirectory, "../../..") : rolloutDirectory;
   const fromDay = path.relative(root, path.dirname(rolloutFile));
   const bounded = !options.includeEarlierDays && /^\d{4}\/\d{2}\/\d{2}$/.test(fromDay);
   const index: SubagentIndex = { byParent: new Map(), byThread: new Map() };
 
-  async function walk(dir: string, rel: string): Promise<void> {
+  async function walk(dir: string, rel: string, recursive = true): Promise<void> {
     if (bounded && rel && rel < fromDay.slice(0, rel.length)) return;
     let entries: Dirent[];
     try {
@@ -116,6 +126,7 @@ export async function buildSubagentIndex(
     for (const entry of entries) {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
+        if (!recursive) continue;
         await walk(full, rel ? `${rel}/${entry.name}` : entry.name);
         continue;
       }
@@ -139,7 +150,16 @@ export async function buildSubagentIndex(
     }
   }
 
-  await walk(root, "");
+  await walk(root, "", dated);
+  const codexHome = path.resolve(process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex"));
+  if (
+    path.dirname(path.resolve(root)) === codexHome &&
+    (path.basename(root) === "sessions" || path.basename(root) === "archived_sessions")
+  ) {
+    if (path.basename(root) !== "sessions") await walk(path.join(codexHome, "sessions"), "", true);
+    if (path.basename(root) !== "archived_sessions")
+      await walk(path.join(codexHome, "archived_sessions"), "", false);
+  }
   return index;
 }
 
@@ -435,9 +455,20 @@ async function emitTurn(
     unannouncedSubagents?: SubagentRollout[];
     inheritableTurnIds?: ReadonlySet<string>;
     historyPrefix?: ChatMlMessage[];
+    incremental?: boolean;
+    hookEvents?: HookEvent[];
+    final?: boolean;
+    emittedHookIds?: Set<string>;
+    legacyIdMode?: boolean;
+    legacyCutoff?: number;
+    legacyUploaded?: boolean;
+    unchanged?: boolean;
+    acknowledgedTurns?: Readonly<Record<string, string>>;
+    pendingTurnFingerprints?: Record<string, string>;
   },
 ): Promise<void> {
   const isSubagent = sessionMeta.isSubagentThread === true || ctx.parentObservation != null;
+  const skipPayloads = ctx.legacyUploaded || ctx.unchanged;
 
   const outerSeed = currentIdSeed();
   seedIds(`${sessionMeta.sessionId}:${turn.turnId ?? "no-turn-id"}`);
@@ -445,8 +476,8 @@ async function emitTurn(
   const root = startObservation(
     isSubagent ? "Codex Subagent Turn" : "Codex Turn",
     {
-      input: toMultimodalContent(turn.userInput, turn.userImages),
-      output: turn.finalOutput,
+      input: skipPayloads ? undefined : toMultimodalContent(turn.userInput, turn.userImages),
+      output: skipPayloads ? undefined : turn.finalOutput,
       level: turn.aborted ? "WARNING" : undefined,
       statusMessage: turn.aborted ? "Turn interrupted by user" : undefined,
       metadata: {
@@ -457,6 +488,8 @@ async function emitTurn(
         "codex.model_provider": sessionMeta.modelProvider,
         "codex.cli_version": sessionMeta.cliVersion,
         "codex.aborted": turn.aborted,
+        ...(skipPayloads ? { "codex.legacy_uploaded": true } : {}),
+        ...(ctx.incremental ? { "codex.completed": ctx.final ?? turn.completed } : {}),
         "codex.tool_call_count": turn.steps.reduce((n, s) => n + s.toolCalls.length, 0),
         ...(ctx.attached && ctx.parentSpanContext
           ? {
@@ -484,20 +517,47 @@ async function emitTurn(
 
   let failure: unknown;
   try {
-    const systemMessage = systemPromptText(turn.systemPrompt);
+    const systemMessage = skipPayloads ? undefined : systemPromptText(turn.systemPrompt);
     const historyPrefix = ctx.historyPrefix ?? [];
     const spawnObservations = new Map<string, LangfuseObservation>();
 
+    let pending = 0;
+    let previousStepFingerprint = createHash("sha256")
+      .update(
+        JSON.stringify({
+          historyPrefix,
+          systemPrompt: turn.systemPrompt,
+          tools: turn.toolDefinitions,
+          model: turn.model,
+          userInput: turn.userInput,
+          userImages: turn.userImages,
+          config: ctx.config,
+          parent: root.otelSpan.spanContext(),
+        }),
+      )
+      .digest("hex");
     for (let i = 0; i < turn.steps.length; i++) {
       const step = turn.steps[i];
+      const stepFingerprintKey = `${sessionMeta.sessionId}:${turn.turnId ?? turn.startTime}:step:${i}`;
+      const stepFingerprint = createHash("sha256")
+        .update(previousStepFingerprint)
+        .update(JSON.stringify(step))
+        .digest("hex");
+      previousStepFingerprint = stepFingerprint;
+      const skipStep =
+        skipPayloads || ctx.acknowledgedTurns?.[stepFingerprintKey] === stepFingerprint;
+      if (ctx.incremental && !ctx.legacyIdMode)
+        seedIds(`${sessionMeta.sessionId}:${turn.turnId ?? turn.startTime}:step:${i}`);
       const generation = startObservation(
         isSubagent ? "LLM Subagent" : "LLM",
         {
-          input: attachToolDefinitions(
-            generationInput(systemMessage, historyPrefix, turn, i),
-            turn.toolDefinitions,
-          ),
-          output: buildGenerationOutput(step),
+          input: skipStep
+            ? undefined
+            : attachToolDefinitions(
+                generationInput(systemMessage, historyPrefix, turn, i),
+                turn.toolDefinitions,
+              ),
+          output: skipStep ? undefined : buildGenerationOutput(step),
           model: turn.model,
           ...(turn.reasoningEffort
             ? { modelParameters: { reasoning_effort: turn.reasoningEffort } }
@@ -505,6 +565,7 @@ async function emitTurn(
           usageDetails: toUsageDetails(step.usage),
           metadata: {
             "codex.step_index": i,
+            ...(skipStep ? { "codex.legacy_uploaded": true } : {}),
             "codex.reasoning_effort": turn.reasoningEffort,
           },
         },
@@ -516,11 +577,36 @@ async function emitTurn(
       );
 
       for (const tc of step.toolCalls) {
-        const observation = emitToolCall(tc, root, step.endTime);
+        if (ctx.incremental && !ctx.legacyIdMode)
+          seedIds(`${sessionMeta.sessionId}:${turn.turnId ?? turn.startTime}:tool:${tc.callId}`);
+        const observation = emitToolCall(tc, root, step.endTime, ctx.incremental, skipPayloads);
         if (tc.name === "spawn_agent") spawnObservations.set(tc.callId, observation);
+        if (ctx.incremental && !skipStep) await backpressureInstrumentation();
+        if (ctx.incremental && !skipStep && ++pending >= 16) {
+          await flushInstrumentation();
+          pending = 0;
+        }
       }
 
       generation.end(new Date(generationEnd(step)));
+      if (ctx.pendingTurnFingerprints)
+        ctx.pendingTurnFingerprints[stepFingerprintKey] = stepFingerprint;
+      if (ctx.incremental && !skipStep && ++pending >= 16) {
+        await flushInstrumentation();
+        pending = 0;
+      }
+    }
+
+    for (const hook of ctx.hookEvents ?? []) {
+      if (
+        !hook.replayOnly &&
+        hook.input.session_id === sessionMeta.sessionId &&
+        hook.input.turn_id === turn.turnId &&
+        !ctx.emittedHookIds?.has(hook.id)
+      ) {
+        emitHookObservation(hook, root.otelSpan.spanContext());
+        ctx.emittedHookIds?.add(hook.id);
+      }
     }
 
     const announced: SubagentRollout[] = [];
@@ -542,6 +628,13 @@ async function emitTurn(
         subagentIndex: ctx.subagentIndex,
         seenThreadIds: ctx.seenThreadIds,
         ancestorTurnIds: ctx.inheritableTurnIds,
+        incremental: ctx.incremental,
+        hookEvents: ctx.hookEvents,
+        emittedHookIds: ctx.emittedHookIds,
+        legacyIdMode: ctx.legacyIdMode,
+        legacyCutoff: ctx.legacyCutoff,
+        acknowledgedTurns: ctx.acknowledgedTurns,
+        pendingTurnFingerprints: ctx.pendingTurnFingerprints,
       });
       seedIds(seedBeforeChild);
     }
@@ -558,22 +651,29 @@ async function emitTurn(
 
   root.end(new Date(turn.endTime));
   seedIds(outerSeed);
-  if (failure && ctx.config.fail_on_error) throw failure;
+  if (failure && (ctx.incremental || ctx.config.fail_on_error)) throw failure;
 }
 
 function emitToolCall(
   tc: ToolCall,
   parent: LangfuseObservation,
   fallbackEnd: number,
+  incremental?: boolean,
+  legacyUploaded?: boolean,
 ): LangfuseObservation {
   const tool = startObservation(
     toolObservationName(tc),
     {
-      input: tc.args,
-      output: tc.output != null ? toText(tc.output) : undefined,
+      input: legacyUploaded ? undefined : tc.args,
+      output: legacyUploaded ? undefined : tc.output != null ? toText(tc.output) : undefined,
       level: tc.error ? "ERROR" : undefined,
       statusMessage: tc.error,
-      metadata: { "codex.call_id": tc.callId, "codex.tool_name": tc.name || "tool" },
+      metadata: {
+        ...(legacyUploaded ? { "codex.legacy_uploaded": true } : {}),
+        "codex.call_id": tc.callId,
+        "codex.tool_name": tc.name || "tool",
+        ...(incremental ? { "codex.completed": tc.endTime != null } : {}),
+      },
     },
     {
       asType: "tool",
@@ -639,11 +739,93 @@ export async function convertRollout(
     seenThreadIds?: Set<string>;
     ancestorTurnIds?: ReadonlySet<string>;
     stoppedTurnId?: string;
+    incremental?: boolean;
+    hookEvents?: HookEvent[];
+    emittedHookIds?: Set<string>;
+    legacyIdMode?: boolean;
+    legacyCutoff?: number;
+    legacyUploaded?: boolean;
+    unchanged?: boolean;
+    acknowledgedTurns?: Readonly<Record<string, string>>;
+    pendingTurnFingerprints?: Record<string, string>;
   },
 ): Promise<string[]> {
   const { sessionMeta, turns } = parseSession(await loadSession(rolloutFile));
+  const emittedHookIds = options.emittedHookIds ?? new Set<string>();
+  const legacyTurnIds = options.incremental
+    ? await loadLegacyTurnIds(rolloutFile)
+    : new Set<string>();
+  const hooks = (options.hookEvents ?? []).filter(
+    (hook) => hook.input.session_id === sessionMeta.sessionId,
+  );
+  for (const hook of hooks) {
+    hook.contextNeeded = false;
+    const turn = hook.input.turn_id
+      ? turns.find((t) => t.turnId === hook.input.turn_id)
+      : turns.filter((candidate) => candidate.startTime <= hook.timestamp).at(-1);
+    if (!turn) {
+      hook.contextNeeded = [
+        "PostToolUse",
+        "Stop",
+        "SubagentStop",
+        "Interrupt",
+        "SessionEnd",
+      ].includes(hook.input.hook_event_name ?? "");
+      continue;
+    }
+    hook.input.turn_id ??= turn.turnId;
+    if (
+      hook.input.hook_event_name === "Stop" ||
+      hook.input.hook_event_name === "Interrupt" ||
+      hook.input.hook_event_name === "SessionEnd" ||
+      (hook.input.hook_event_name === "SubagentStop" &&
+        (sessionMeta.isSubagentThread || options.parentObservation != null))
+    ) {
+      hook.contextNeeded = !turn.completed;
+      if (!turn.completed) turn.endTime = Math.max(turn.endTime, hook.timestamp);
+      turn.completed = true;
+      turn.aborted ||= hook.input.hook_event_name === "Interrupt";
+      if (
+        typeof hook.input.last_assistant_message === "string" &&
+        turn.finalOutput !== hook.input.last_assistant_message
+      ) {
+        turn.finalOutput = hook.input.last_assistant_message;
+        hook.contextNeeded = true;
+      }
+    }
+    // Native hooks run before the rollout writer necessarily flushes tool outputs.
+    const toolId = hook.input.tool_use_id ?? hook.input.tool_call_id;
+    if (hook.input.hook_event_name === "PostToolUse" && toolId) {
+      const tool = turn.steps.flatMap((step) => step.toolCalls).find((tc) => tc.callId === toolId);
+      if (!tool) hook.contextNeeded = true;
+      if (tool && tool.output == null && hook.input.tool_response !== undefined) {
+        hook.contextNeeded = true;
+        tool.output = hook.input.tool_response;
+        tool.endTime = hook.timestamp;
+        turn.endTime = Math.max(turn.endTime, hook.timestamp);
+      }
+    }
+  }
 
   const historyPrefixes: ChatMlMessage[][] = [];
+  const turnFingerprints = turns.map((turn) =>
+    createHash("sha256")
+      .update(
+        JSON.stringify({
+          turn,
+          config: options.config,
+          parent: options.parentObservation?.otelSpan.spanContext() ?? options.parentSpanContext,
+        }),
+      )
+      .digest("hex"),
+  );
+  for (let i = 0; i < turns.length; i++) {
+    // Include earlier conversation changes without rebuilding every generation input.
+    if (i > 0)
+      turnFingerprints[i] = createHash("sha256")
+        .update(`${turnFingerprints[i - 1]}:${turnFingerprints[i]}`)
+        .digest("hex");
+  }
   {
     const seen: ChatMlMessage[] = [];
     for (const turn of turns) {
@@ -708,16 +890,30 @@ export async function convertRollout(
     for (let turnIndex = 0; turnIndex < turns.length; turnIndex++) {
       const turn = turns[turnIndex];
       if (skipInherited(turn, turnIndex)) continue;
+      const fingerprintKey = `${sessionMeta.sessionId}:${turn.turnId ?? turn.startTime}`;
       await emitTurn(turn, sessionMeta, {
         config: options.config,
         rolloutFile,
+        unchanged: options.acknowledgedTurns?.[fingerprintKey] === turnFingerprints[turnIndex],
+        acknowledgedTurns: options.acknowledgedTurns,
+        pendingTurnFingerprints: options.pendingTurnFingerprints,
         parentObservation: options.parentObservation,
         subagentIndex,
         seenThreadIds,
         unannouncedSubagents: subagentsFor(turnIndex),
         inheritableTurnIds,
         historyPrefix: historyPrefixes[turnIndex],
+        incremental: options.incremental,
+        hookEvents: options.hookEvents,
+        emittedHookIds,
+        legacyIdMode: options.legacyIdMode,
+        legacyCutoff: options.legacyCutoff,
+        legacyUploaded:
+          options.legacyIdMode && turn.completed && turn.endTime <= (options.legacyCutoff ?? 0),
+        final: isFinal(turn, options.stoppedTurnId, turnIndex < turns.length - 1),
       });
+      if (options.pendingTurnFingerprints)
+        options.pendingTurnFingerprints[fingerprintKey] = turnFingerprints[turnIndex];
     }
     return [];
   }
@@ -731,11 +927,12 @@ export async function convertRollout(
 
     if (skipInherited(turn, turnIndex)) continue;
 
-    if (!isFinal(turn, options.stoppedTurnId, turnIndex < turns.length - 1)) {
+    const final = isFinal(turn, options.stoppedTurnId, turnIndex < turns.length - 1);
+    if (!options.incremental && !final) {
       debugLog(`skipping turn ${turn.turnId ?? "(no turn id)"}: not final`);
       continue;
     }
-    if (uploaded.has(turn.turnId)) {
+    if (!options.incremental && turn.turnId && uploaded.has(turn.turnId)) {
       continue;
     }
 
@@ -743,10 +940,14 @@ export async function convertRollout(
       options.parentSpanContext ??
       (await seededTraceParent(options.config, sessionMeta, turnIndex + 1));
 
+    const fingerprintKey = `${sessionMeta.sessionId}:${turn.turnId ?? turn.startTime}`;
     const emit = () =>
       emitTurn(turn, sessionMeta, {
         config: options.config,
         rolloutFile,
+        unchanged: options.acknowledgedTurns?.[fingerprintKey] === turnFingerprints[turnIndex],
+        acknowledgedTurns: options.acknowledgedTurns,
+        pendingTurnFingerprints: options.pendingTurnFingerprints,
         parentSpanContext,
         attached,
         subagentIndex,
@@ -754,6 +955,13 @@ export async function convertRollout(
         unannouncedSubagents: subagentsFor(turnIndex),
         inheritableTurnIds,
         historyPrefix: historyPrefixes[turnIndex],
+        incremental: options.incremental,
+        hookEvents: options.hookEvents,
+        emittedHookIds,
+        legacyIdMode: legacyTurnIds.has(turn.turnId ?? ""),
+        legacyCutoff: legacyTurnIds.has(turn.turnId ?? "") ? turn.endTime : undefined,
+        legacyUploaded: legacyTurnIds.has(turn.turnId ?? ""),
+        final: isFinal(turn, options.stoppedTurnId, turnIndex < turns.length - 1),
       });
 
     if (attached) {
@@ -772,9 +980,78 @@ export async function convertRollout(
       );
     }
 
-    uploaded.add(turn.turnId);
-    exportedTurnIds.push(turn.turnId);
+    if (options.pendingTurnFingerprints)
+      options.pendingTurnFingerprints[fingerprintKey] = turnFingerprints[turnIndex];
+    if (final && turn.turnId && !uploaded.has(turn.turnId)) {
+      uploaded.add(turn.turnId);
+      exportedTurnIds.push(turn.turnId);
+    }
   }
 
+  if (options.incremental && !options.parentObservation) {
+    for (const hook of options.hookEvents ?? []) {
+      if (!hook.replayOnly && !emittedHookIds.has(hook.id)) {
+        emitHookObservation(hook);
+        emittedHookIds.add(hook.id);
+      }
+    }
+  }
   return exportedTurnIds;
+}
+
+export function emitHookObservation(hook: HookEvent, parentSpanContext?: SpanContext): void {
+  const previous = currentIdSeed();
+  seedIds(`hook:${hook.id}`);
+  const emit = () =>
+    startObservation(
+      `Codex Hook: ${hook.input.hook_event_name ?? "Unknown"}`,
+      {
+        input: hook.input,
+        metadata: {
+          "codex.hook_event_name": hook.input.hook_event_name,
+          "codex.thread_id": hook.input.session_id,
+          "codex.turn_id": hook.input.turn_id,
+        },
+      },
+      {
+        asType: "span",
+        startTime: new Date(hook.timestamp),
+        parentSpanContext: hook.standalone ? undefined : parentSpanContext,
+      },
+    );
+  const observation = emit();
+  observation.otelSpan.setAttribute(LangfuseOtelSpanAttributes.OBSERVATION_TYPE, "event");
+  if (hook.input.session_id && (hook.standalone || !parentSpanContext)) {
+    observation.otelSpan.setAttribute(
+      LangfuseOtelSpanAttributes.TRACE_SESSION_ID,
+      hook.input.session_id,
+    );
+    observation.otelSpan.setAttribute(
+      LangfuseOtelSpanAttributes.TRACE_COMPAT_SESSION_ID,
+      hook.input.session_id,
+    );
+  }
+  observation.end(new Date(hook.timestamp));
+  seedIds(previous);
+}
+
+/** Child hooks use the same root checkpoint and parenting as parent hooks. */
+export async function resolveRootRollout(
+  rolloutFile: string,
+): Promise<{ file: string; index: SubagentIndex }> {
+  const meta = await readSessionMeta(rolloutFile);
+  const index = await buildSubagentIndex(rolloutFile, {
+    includeEarlierDays: !!meta?.parentThreadId,
+  });
+  let file = rolloutFile;
+  let parent = meta?.parentThreadId;
+  const seen = new Set<string>();
+  while (parent && !seen.has(parent)) {
+    seen.add(parent);
+    const ancestor = index.byThread.get(parent);
+    if (!ancestor) break;
+    file = ancestor.file;
+    parent = ancestor.parentThreadId;
+  }
+  return { file, index };
 }

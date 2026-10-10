@@ -1,14 +1,14 @@
 {
-  "name": "codex-observability-plugin",
+  "name": "donadio-codex-observability",
   "interface": {
-    "displayName": "Langfuse"
+    "displayName": "Langfuse realtime tracing"
   },
   "plugins": [
     {
       "name": "tracing",
       "source": {
-        "source": "npm",
-        "package": "@langfuse/codex-observability-plugin"
+        "source": "local",
+        "path": "./plugins/tracing"
       },
       "policy": {
         "installation": "AVAILABLE",

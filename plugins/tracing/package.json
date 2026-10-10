@@ -1,19 +1,19 @@
 {
-  "name": "@langfuse/codex-observability-plugin",
-  "version": "0.4.2",
+  "name": "@donadiosolutions/codex-observability-plugin",
+  "version": "0.5.0-donadio.1",
   "description": "Langfuse observability plugin for the OpenAI Codex coding agent for tracing prompts, agent turns, model generations, and tool calls.",
   "license": "MIT",
   "author": "Langfuse",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/langfuse/codex-observability-plugin.git",
+    "url": "https://github.com/donadiosolutions/codex-observability-plugin.git",
     "directory": "plugins/tracing"
   },
   "bugs": {
-    "url": "https://github.com/langfuse/codex-observability-plugin/issues"
+    "url": "https://github.com/donadiosolutions/codex-observability-plugin/issues"
   },
-  "homepage": "https://github.com/langfuse/codex-observability-plugin#readme",
+  "homepage": "https://github.com/donadiosolutions/codex-observability-plugin#readme",
   "keywords": [
     "codex",
     "codex-plugin",

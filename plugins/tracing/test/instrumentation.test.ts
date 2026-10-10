@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { getLangfuseTracerProvider, setLangfuseTracerProvider } from "@langfuse/tracing";
-import type { ReadableSpan, SpanProcessor } from "@opentelemetry/sdk-trace-base";
+import type { ReadableSpan, SpanExporter, SpanProcessor } from "@opentelemetry/sdk-trace-base";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Config } from "../src/config.js";
@@ -14,15 +14,25 @@ import { convertRollout } from "../src/trace.js";
 // Capture the spans the plugin's own span processor receives, so the assertion
 // needs no network and no Langfuse credentials.
 const captured: ReadableSpan[] = [];
+let dropPreparation = false;
 
 vi.mock("@langfuse/otel", () => ({
   LangfuseSpanProcessor: class implements SpanProcessor {
+    private readonly exporter: SpanExporter;
+    constructor(params: { exporter: SpanExporter }) {
+      this.exporter = params.exporter;
+    }
     onStart(): void {}
     onEnd(span: ReadableSpan): void {
       captured.push(span);
+      if (!dropPreparation) this.exporter.export([span], () => {});
     }
-    async forceFlush(): Promise<void> {}
-    async shutdown(): Promise<void> {}
+    async forceFlush(): Promise<void> {
+      await this.exporter.forceFlush?.();
+    }
+    async shutdown(): Promise<void> {
+      await this.exporter.shutdown();
+    }
   },
 }));
 
@@ -72,6 +82,11 @@ let previousGlobal: unknown;
 
 beforeEach(() => {
   captured.length = 0;
+  dropPreparation = false;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => new Response("{}")),
+  );
   previousGlobal = occupyGlobalRegistry();
 });
 
@@ -79,6 +94,7 @@ afterEach(() => {
   (globalThis as Record<symbol, unknown>)[OTEL_API_KEY] = previousGlobal;
   setLangfuseTracerProvider(null);
   vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
 });
 
 async function resourceAttrsOfExportedSpan(): Promise<Record<string, unknown>> {
@@ -112,6 +128,15 @@ describe("setupInstrumentation", () => {
     await instrumentation.shutdown();
 
     expect(getLangfuseTracerProvider()).not.toBe(bound);
+  });
+
+  it("rejects shutdown if the SDK swallowed a preparation failure", async () => {
+    dropPreparation = true;
+    const instrumentation = setupInstrumentation(baseConfig);
+    getLangfuseTracerProvider().getTracer("test").startSpan("lost-before-export").end();
+    await expect(instrumentation.shutdown()).rejects.toThrow("preparation failed");
+    expect(getLangfuseTracerProvider()).not.toBeUndefined();
+    expect(instrumentation.acknowledged()).toEqual({});
   });
 });
 

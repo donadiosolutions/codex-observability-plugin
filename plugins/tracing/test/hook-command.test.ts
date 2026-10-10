@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { afterEach, describe, expect, it } from "vitest";
+import { acquireRolloutLock } from "../src/sidecar.js";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const hookConfigFile = path.join(repoRoot, "plugins/tracing/hooks/hooks.json");
@@ -163,7 +164,7 @@ describe("bundled Stop hook command", () => {
     }
   });
 
-  it("re-exports a rollout as a byte-identical payload so Langfuse deduplicates it", async () => {
+  it("exports only a fresh hook event when observations are unchanged", async () => {
     const codexHome = makeTempDir("lf-codex-home-");
     const sessionCwd = makeTempDir("lf-codex-cwd-");
     const sessionsDir = path.join(sessionCwd, "sessions", "2026", "06", "03");
@@ -202,7 +203,6 @@ describe("bundled Stop hook command", () => {
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
         runs.push([]);
-        fs.rmSync(`${rollout}.langfuse`, { force: true });
         const { code } = await runShellCommand(readHookCommand(), {
           cwd: sessionCwd,
           env: {
@@ -226,7 +226,24 @@ describe("bundled Stop hook command", () => {
       }
 
       expect(runs[0].length).toBeGreaterThan(0);
-      expect(Buffer.concat(runs[1]).equals(Buffer.concat(runs[0]))).toBe(true);
+      const spansIn = (requests: Buffer[]) =>
+        requests.flatMap((request) => {
+          const body = JSON.parse(request.toString("utf8")) as {
+            resourceSpans: Array<{
+              scopeSpans: Array<{ spans: Array<{ name: string; spanId: string }> }>;
+            }>;
+          };
+          return body.resourceSpans.flatMap((resource) =>
+            resource.scopeSpans.flatMap((scope) => scope.spans),
+          );
+        });
+      const first = spansIn(runs[0]);
+      const second = spansIn(runs[1]);
+      expect(first.some((span) => span.name === "Codex Turn")).toBe(true);
+      expect(second.map((span) => span.name)).toEqual(["Codex Hook: Stop"]);
+      expect(second[0].spanId).not.toBe(
+        first.find((span) => span.name === "Codex Hook: Stop")!.spanId,
+      );
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
@@ -235,4 +252,250 @@ describe("bundled Stop hook command", () => {
   it("uses no shell syntax beyond the placeholder Codex substitutes itself", () => {
     expect(readHookCommand().replaceAll("${PLUGIN_ROOT}", "")).not.toContain("$");
   });
+});
+
+it("retries a failed SessionStart event after the rollout becomes available", async () => {
+  const codexHome = makeTempDir("lf-codex-early-home-");
+  const sessionCwd = makeTempDir("lf-codex-early-cwd-");
+  const day = path.join(sessionCwd, "sessions/2026/06/03");
+  fs.mkdirSync(day, { recursive: true });
+  const file = path.join(day, "rollout.jsonl");
+  const line = (type: string, payload: unknown) =>
+    JSON.stringify({ timestamp: "2026-06-03T12:00:00.000Z", type, payload });
+  fs.writeFileSync(
+    file,
+    [
+      line("session_meta", { id: "early-session" }),
+      line("event_msg", { type: "task_started", turn_id: "early-turn" }),
+      line("event_msg", { type: "user_message", message: "work" }),
+    ].join("\n") + "\n",
+  );
+  let accepting = false;
+  const delivered: string[] = [];
+  const server = http.createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      if (accepting) delivered.push(Buffer.concat(chunks).toString("utf8"));
+      res.writeHead(accepting ? 200 : 503, { "content-type": "application/json" });
+      res.end("{}");
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as { port: number };
+  const env = {
+    ...process.env,
+    PLUGIN_ROOT: pluginRootDir,
+    CODEX_HOME: codexHome,
+    HOME: codexHome,
+    TRACE_TO_LANGFUSE: "true",
+    LANGFUSE_PUBLIC_KEY: "pk-lf-test",
+    LANGFUSE_SECRET_KEY: "sk-lf-test",
+    LANGFUSE_BASE_URL: `http://127.0.0.1:${port}`,
+    LANGFUSE_CODEX_FAIL_ON_ERROR: "true",
+  };
+  try {
+    const failed = await runShellCommand(readHookCommand(), {
+      cwd: sessionCwd,
+      env,
+      input: JSON.stringify({ hook_event_name: "SessionStart", session_id: "early-session" }),
+    });
+    expect(failed.code).toBe(1);
+    const spoolRoot = path.join(codexHome, "langfuse-hooks");
+    const pending = fs.readdirSync(spoolRoot).find((name) => name.endsWith(".langfuse-pending"))!;
+    expect(fs.readdirSync(path.join(spoolRoot, pending))).toHaveLength(1);
+    accepting = true;
+    const recovered = await runShellCommand(readHookCommand(), {
+      cwd: sessionCwd,
+      env,
+      input: JSON.stringify({
+        hook_event_name: "PostToolUse",
+        session_id: "early-session",
+        turn_id: "early-turn",
+        transcript_path: file,
+      }),
+    });
+    expect(recovered.code).toBe(0);
+    expect(delivered.join("")).toContain("Codex Hook: SessionStart");
+    expect(delivered.join("")).toContain("Codex Hook: PostToolUse");
+    expect(fs.readdirSync(path.join(spoolRoot, pending))).toHaveLength(0);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+it.each(["native", "legacy"])(
+  "finalizes the child for %s SubagentStop payloads without finalizing its parent",
+  async (shape) => {
+    const codexHome = makeTempDir("lf-codex-child-home-");
+    const cwd = makeTempDir("lf-codex-child-cwd-");
+    const day = path.join(cwd, "sessions/2026/06/03");
+    fs.mkdirSync(day, { recursive: true });
+    const parentFile = path.join(day, "rollout-parent.jsonl");
+    const childFile = path.join(day, "rollout-child.jsonl");
+    const line = (second: number, type: string, payload: unknown) =>
+      JSON.stringify({
+        timestamp: new Date(Date.UTC(2026, 5, 3, 12, 0, second)).toISOString(),
+        type,
+        payload,
+      });
+    fs.writeFileSync(
+      parentFile,
+      [
+        line(0, "session_meta", { id: "native-parent" }),
+        line(1, "event_msg", { type: "task_started", turn_id: "parent-turn" }),
+        line(2, "event_msg", { type: "user_message", message: "delegate" }),
+      ].join("\n") + "\n",
+    );
+    fs.writeFileSync(
+      childFile,
+      [
+        line(3, "session_meta", { id: "native-child", parent_thread_id: "native-parent" }),
+        line(4, "event_msg", { type: "task_started", turn_id: "child-turn" }),
+        line(5, "event_msg", { type: "agent_message", message: "child done" }),
+      ].join("\n") + "\n",
+    );
+    if (shape === "native") {
+      fs.appendFileSync(
+        childFile,
+        [
+          line(6, "event_msg", { type: "task_started", turn_id: "child-next-turn" }),
+          line(7, "event_msg", {
+            type: "user_message",
+            message: "child resumed before delayed hook dispatch",
+          }),
+        ].join("\n") + "\n",
+      );
+    }
+    type Span = {
+      name: string;
+      spanId: string;
+      parentSpanId?: string;
+      attributes: Array<{ key: string; value: { stringValue?: string } }>;
+    };
+    const received: Span[] = [];
+    const server = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk) => chunks.push(chunk));
+      req.on("end", () => {
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+          resourceSpans: Array<{ scopeSpans: Array<{ spans: Span[] }> }>;
+        };
+        received.push(
+          ...body.resourceSpans.flatMap((resource) =>
+            resource.scopeSpans.flatMap((scope) => scope.spans),
+          ),
+        );
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end("{}");
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as { port: number };
+    try {
+      const result = await runShellCommand(readHookCommand(), {
+        cwd,
+        env: {
+          ...process.env,
+          PLUGIN_ROOT: pluginRootDir,
+          CODEX_HOME: codexHome,
+          HOME: codexHome,
+          TRACE_TO_LANGFUSE: "true",
+          LANGFUSE_PUBLIC_KEY: "pk-lf-test",
+          LANGFUSE_SECRET_KEY: "sk-lf-test",
+          LANGFUSE_BASE_URL: `http://127.0.0.1:${port}`,
+          LANGFUSE_CODEX_FAIL_ON_ERROR: "true",
+        },
+        input: JSON.stringify({
+          hook_event_name: "SubagentStop",
+          session_id: shape === "native" ? "native-child" : "native-parent",
+          turn_id: shape === "native" ? "child-turn" : "parent-turn",
+          transcript_path: parentFile,
+          agent_id: "native-child",
+          agent_transcript_path: childFile,
+        }),
+      });
+      expect(result.code).toBe(0);
+      const parent = received.find((span) => span.name === "Codex Turn")!;
+      const child = received.find((span) => span.name === "Codex Subagent Turn")!;
+      const hook = received.find((span) => span.name === "Codex Hook: SubagentStop")!;
+      const completed = (span: Span) =>
+        span.attributes.find((attr) => attr.key === "langfuse.observation.metadata.codex.completed")
+          ?.value.stringValue;
+      expect(completed(parent)).toBe("false");
+      expect(completed(child)).toBe("true");
+      expect(hook.parentSpanId).toBe(child.spanId);
+      expect(fs.existsSync(`${parentFile}.langfuse`)).toBe(false);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  },
+);
+
+it("waits briefly for an active uploader before the final SessionEnd drain", async () => {
+  const codexHome = makeTempDir("lf-codex-end-home-");
+  const cwd = makeTempDir("lf-codex-end-cwd-");
+  const day = path.join(cwd, "sessions/2026/06/03");
+  fs.mkdirSync(day, { recursive: true });
+  const file = path.join(day, "rollout.jsonl");
+  const line = (type: string, payload: unknown) =>
+    JSON.stringify({ timestamp: "2026-06-03T12:00:00.000Z", type, payload });
+  fs.writeFileSync(
+    file,
+    [
+      line("session_meta", { id: "end-session" }),
+      line("event_msg", { type: "task_started", turn_id: "end-turn" }),
+      line("event_msg", { type: "user_message", message: "work" }),
+    ].join("\n") + "\n",
+  );
+  const received: string[] = [];
+  const server = http.createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      received.push(Buffer.concat(chunks).toString("utf8"));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as { port: number };
+  const release = await acquireRolloutLock(file);
+  expect(release).toBeDefined();
+  let released = false;
+  let releasePromise: Promise<void> | undefined;
+  const timer = setTimeout(() => {
+    released = true;
+    releasePromise = release!();
+  }, 600);
+  try {
+    const result = await runShellCommand(readHookCommand(), {
+      cwd,
+      env: {
+        ...process.env,
+        PLUGIN_ROOT: pluginRootDir,
+        CODEX_HOME: codexHome,
+        HOME: codexHome,
+        TRACE_TO_LANGFUSE: "true",
+        LANGFUSE_PUBLIC_KEY: "pk-lf-test",
+        LANGFUSE_SECRET_KEY: "sk-lf-test",
+        LANGFUSE_BASE_URL: `http://127.0.0.1:${port}`,
+        LANGFUSE_CODEX_FAIL_ON_ERROR: "true",
+      },
+      input: JSON.stringify({
+        hook_event_name: "SessionEnd",
+        session_id: "end-session",
+        transcript_path: file,
+      }),
+    });
+    expect(result.code).toBe(0);
+    expect(released).toBe(true);
+    expect(received.join("")).toContain("Codex Hook: SessionEnd");
+    expect(fs.readFileSync(`${file}.langfuse`, "utf8").trim()).toBe("end-turn");
+  } finally {
+    clearTimeout(timer);
+    if (!released) await release!();
+    else await releasePromise;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });
