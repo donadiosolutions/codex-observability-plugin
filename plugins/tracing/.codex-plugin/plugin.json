@@ -1,21 +1,21 @@
 {
   "name": "tracing",
-  "version": "0.4.2",
+  "version": "0.5.0-donadio.2",
   "description": "Trace OpenAI Codex sessions to Langfuse.",
   "author": {
     "name": "Langfuse",
     "email": "support@langfuse.com",
     "url": "https://langfuse.com"
   },
-  "homepage": "https://github.com/langfuse/codex-observability-plugin#readme",
-  "repository": "https://github.com/langfuse/codex-observability-plugin",
+  "homepage": "https://github.com/donadiosolutions/codex-observability-plugin#readme",
+  "repository": "https://github.com/donadiosolutions/codex-observability-plugin",
   "license": "MIT",
   "keywords": ["codex", "hooks", "langfuse", "observability", "tracing"],
   "hooks": "./hooks/hooks.json",
   "interface": {
     "displayName": "Tracing",
     "shortDescription": "Trace Codex sessions to Langfuse",
-    "longDescription": "Uploads completed OpenAI Codex rollout transcripts to Langfuse so teams can inspect Codex sessions as traces: agent turns, model calls, tool executions, token usage, and subagent threads.",
+    "longDescription": "Uploads Codex activity incrementally across all supported hooks, with asynchronous delivery and acknowledged observation checkpoints.",
     "developerName": "Langfuse",
     "category": "Coding",
     "capabilities": ["Read"],

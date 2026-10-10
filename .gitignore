@@ -4,12 +4,14 @@ node_modules/
 
 # Codex writes a per-rollout dedup sidecar next to each transcript at runtime.
 *.jsonl.langfuse
+*.jsonl.langfuse-*
 
 # Local debugging
 debug.log
 
 # Build output
-plugins/tracing/dist/
+plugins/tracing/dist/*
+!plugins/tracing/dist/index.mjs
 
 # Claude Code scratch space; globbed so a later `!` negation works.
 .claude/*

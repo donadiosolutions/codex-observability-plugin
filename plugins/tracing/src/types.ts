@@ -163,6 +163,15 @@ export type HookInput = {
   turn_id?: string | null;
   transcript_path?: string | null;
   hook_event_name?: string;
+  agent_transcript_path?: string | null;
+  agent_id?: string;
+  tool_use_id?: string;
+  tool_call_id?: string;
+  last_assistant_message?: string | null;
+  tool_name?: string;
+  tool_input?: unknown;
+  tool_response?: unknown;
+  [key: string]: unknown;
 };
 
 export type SessionMeta = {
@@ -226,4 +235,14 @@ export type Turn = {
   systemPrompt?: SystemPrompt;
   userImages: string[];
   toolDefinitions: ToolDefinition[];
+};
+
+/** Persisted before dispatch so retries keep their observation identity. */
+export type HookEvent = {
+  id: string;
+  timestamp: number;
+  input: HookInput;
+  standalone?: boolean;
+  replayOnly?: boolean;
+  contextNeeded?: boolean;
 };

@@ -10,20 +10,20 @@
     "tracing",
     "opentelemetry"
   ],
-  "homepage": "https://github.com/langfuse/codex-observability-plugin#readme",
+  "homepage": "https://github.com/donadiosolutions/codex-observability-plugin#readme",
   "bugs": {
-    "url": "https://github.com/langfuse/codex-observability-plugin/issues"
+    "url": "https://github.com/donadiosolutions/codex-observability-plugin/issues"
   },
   "license": "MIT",
   "author": "Langfuse",
   "repository": {
     "type": "git",
-    "url": "https://github.com/langfuse/codex-observability-plugin.git"
+    "url": "https://github.com/donadiosolutions/codex-observability-plugin.git"
   },
   "type": "module",
   "scripts": {
     "build": "tsdown --config plugins/tracing/tsdown.config.ts",
-    "test": "pnpm run build && vitest run",
+    "test": "pnpm run build && vitest run --maxWorkers=1 --no-file-parallelism",
     "test:watch": "pnpm run build && vitest",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
@@ -36,6 +36,7 @@
     "@opentelemetry/api": "^1.9.0",
     "@opentelemetry/core": "^2.11.0",
     "@opentelemetry/exporter-trace-otlp-http": "^0.222.0",
+    "@opentelemetry/otlp-transformer": "0.222.0",
     "@opentelemetry/resources": "^2.11.0",
     "@opentelemetry/sdk-trace-base": "^2.11.0",
     "@opentelemetry/sdk-trace-node": "^2.11.0",
