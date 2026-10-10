@@ -44,8 +44,9 @@ turns keep stable observation IDs as their input, output, usage, and completion
 state change. Hook payloads cover transcript-flush races; child uploads resolve
 their parent trace so a child can finish after its parent turn.
 
-All hooks run asynchronously except `SessionEnd`, which attempts a final
-drain before Codex cancels outstanding async work. Codex limits `SessionEnd`
+Live activity hooks run asynchronously. `Stop`, `SubagentStop`, `Interrupt`,
+and `SessionEnd` flush synchronously because Codex cancels outstanding async
+hooks before invoking its session-end handlers. Codex limits `SessionEnd`
 and `Interrupt` to three seconds; pending payloads are saved before transcript
 discovery and remain retryable if that deadline interrupts delivery. The supported events
 are `PreToolUse`, `PermissionRequest`, `PostToolUse`, `PreCompact`, `PostCompact`,

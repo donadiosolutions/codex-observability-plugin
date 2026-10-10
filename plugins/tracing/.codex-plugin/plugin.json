@@ -1,6 +1,6 @@
 {
   "name": "tracing",
-  "version": "0.5.0-donadio.1",
+  "version": "0.5.0-donadio.2",
   "description": "Trace OpenAI Codex sessions to Langfuse.",
   "author": {
     "name": "Langfuse",

@@ -68,6 +68,15 @@ afterEach(() => {
 });
 
 describe("bundled Stop hook command", () => {
+  it("flushes terminal hooks synchronously before native shutdown cancels async work", () => {
+    const { hooks } = JSON.parse(fs.readFileSync(hookConfigFile, "utf8"));
+    const terminal = new Set(["Stop", "SubagentStop", "Interrupt", "SessionEnd"]);
+    expect(Object.keys(hooks)).toHaveLength(12);
+    for (const [name, groups] of Object.entries(hooks)) {
+      const handler = (groups as Array<{ hooks: Array<{ async: boolean }> }>)[0].hooks[0];
+      expect(handler.async, name).toBe(!terminal.has(name));
+    }
+  });
   it("runs from an arbitrary session cwd via PLUGIN_ROOT instead of a relative repo path", async () => {
     const codexHome = makeTempDir("lf-codex-home-");
     const sessionCwd = makeTempDir("lf-codex-cwd-");
